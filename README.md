@@ -1,1 +1,1 @@
-Dual-Domain Multi-Directional Enhancement Network Driven by Vision LSTM for Medical Image Segmentation
+A Spatial-Frequency Domain Network with Bidirectional ViL and Multi-Feature Calibration for Medical Image Segmentation
