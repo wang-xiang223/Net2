@@ -9,10 +9,8 @@ from utils.mynet.paper2.vision_lstm2 import  SequenceTraversal,LinearHeadwiseExp
 from utils.mynet.paper2.vision_lstm_util import interpolate_sincos, to_ntuple, VitPatchEmbed, VitPosEmbed2d, DropPath, SequenceConv2d
 from torch.cuda.amp import autocast
 from thop import profile, clever_format
+import time
 
-# ---------------------------
-# SSAM Block
-# ---------------------------
 class SSAMLayer(nn.Module):
     def __init__(
         self,
@@ -35,23 +33,27 @@ class SSAMLayer(nn.Module):
         self.num_bands = num_bands
         self.enable_scale = enable_scale
 
+      
+        self.spline_num = grid_size + spline_order
         self.spline_weights = nn.ParameterList([
-            nn.Parameter(torch.Tensor(self.out_features, self.in_features))
+            nn.Parameter(torch.Tensor(self.out_features, self.in_features, self.spline_num))
             for _ in range(num_bands)
         ])
+        
         if enable_scale:
             self.scalers = nn.ParameterList([
                 nn.Parameter(torch.Tensor(self.out_features, self.in_features))
                 for _ in range(num_bands)
             ])
         
+        
         h = (grid_range[1] - grid_range[0]) / grid_size
         self.register_buffer("grid", 
-            torch.arange(-spline_order, grid_size+spline_order+1) * h + grid_range[0]
+            torch.arange(-spline_order, grid_size + spline_order + 1) * h + grid_range[0]
         )
         self.reset_parameters()
 
-      
+       
         self.feature_transform = nn.Sequential(
             nn.Conv2d(self.in_features, self.in_features, kernel_size=3, padding=1, groups=self.in_features, bias=False),
             nn.BatchNorm2d(self.in_features),
@@ -75,7 +77,7 @@ class SSAMLayer(nn.Module):
 
     def reset_parameters(self):
         for w in self.spline_weights:
-            nn.init.normal_(w, std=1/math.sqrt(self.in_features))
+            nn.init.normal_(w, std=1/(math.sqrt(self.in_features) * math.sqrt(self.spline_num)))
         if self.enable_scale:
             for s in self.scalers:
                 nn.init.uniform_(s, 0.9, 1.1)
@@ -89,90 +91,91 @@ class SSAMLayer(nn.Module):
         for i in range(self.num_bands):
             start = i * band_size
             end = None if i == self.num_bands-1 else (i+1)*band_size
-            band = torch.fft.irfft(x_fft[..., start:end], n=C)
+         
+            band_fft = torch.zeros_like(x_fft)
+            band_fft[..., start:end] = x_fft[..., start:end]
+            band = torch.fft.irfft(band_fft, n=C)
             decomposed.append(band.view(B, H, W, C))  
         return torch.stack(decomposed, dim=1)  
     
     def _compute_splines(self, x):
+        """
+        核心函数：利用 Cox-de Boor 递归算法实现高阶多项式拟合
+        """
         B, Band, H, W, C = x.shape
-        x = x.view(B, Band, H * W, C) 
+        x_flat = x.view(B, Band, H * W, C) 
         outputs = []
+        
         for b in range(self.num_bands):
-            band_x = x[:, b, :, :] 
-            bases = (band_x.unsqueeze(-1) >= self.grid[:-1]) & (band_x.unsqueeze(-1) < self.grid[1:])
+            band_x = x_flat[:, b, :, :] # (B, L, C)
+            grid = self.grid
+            x_un = band_x.unsqueeze(-1) # (B, L, C, 1)
+            
+  
+            bases = (x_un >= grid[:-1]) & (x_un < grid[1:])
             bases = bases.to(band_x.dtype)
+            
+          
             for k in range(1, self.spline_order + 1):
                 bases = (
-                    (band_x.unsqueeze(-1) - self.grid[:-(k + 1)]) / 
-                    (self.grid[k:-1] - self.grid[:-(k + 1)]).clamp_min(1e-6) * bases[..., :-1]
+                    (x_un - grid[:-(k + 1)]) / 
+                    (grid[k:-1] - grid[:-(k + 1)]).clamp_min(1e-6) * bases[..., :-1]
                 ) + (
-                    (self.grid[k + 1:] - band_x.unsqueeze(-1)) / 
-                    (self.grid[k + 1:] - self.grid[1:-k]).clamp_min(1e-6) * bases[..., 1:]
+                    (grid[k + 1:] - x_un) / 
+                    (grid[k + 1:] - grid[1:-k]).clamp_min(1e-6) * bases[..., 1:]
                 )
-            weight = self.spline_weights[b]
+            
+       
+            weight = self.spline_weights[b] 
             if self.enable_scale:
-                weight = weight * self.scalers[b]
-            output = torch.einsum('bci,oi->bci', band_x, weight)  
+                weight = weight * self.scalers[b].unsqueeze(-1)
+            
+        
+            output = torch.einsum('blcg,ocg->blo', bases, weight) 
             outputs.append(output)
+            
         return torch.stack(outputs, dim=1)  
 
     def _attention(self, x):
         B, Band, H, W, C = x.shape
-        x = x.view(B * Band, C, H, W) 
-        x = self.feature_transform(x)
-        channel_weights = self.channel_attention(x)
-        x = x * channel_weights
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out = torch.max(x, dim=1, keepdim=True)[0]
+
+        x_reshaped = x.permute(0, 1, 4, 2, 3).reshape(B * Band, C, H, W) 
+        x_reshaped = self.feature_transform(x_reshaped)
+        
+        channel_weights = self.channel_attention(x_reshaped)
+        x_reshaped = x_reshaped * channel_weights
+        
+        avg_out = torch.mean(x_reshaped, dim=1, keepdim=True)
+        max_out = torch.max(x_reshaped, dim=1, keepdim=True)[0]
         spatial_features = torch.cat([avg_out, max_out], dim=1)
         spatial_weights = self.spatial_attention(spatial_features)
-        x = x * spatial_weights
-        x = x.view(B, Band, H, W, C)
-        return x
+        
+        x_reshaped = x_reshaped * spatial_weights
+        return x_reshaped.view(B, Band, C, H, W).permute(0, 1, 3, 4, 2)
 
     def forward(self, x):
         B, C, H, W = x.shape
-        x_decomposed = self._spectral_decompose(x)  
-        B, Band, H, W, C = x_decomposed.shape
-        x_decomposed = x_decomposed.view(B * Band, C, H, W)  
-        x_decomposed = self.feature_transform(x_decomposed)
-        x_decomposed = x_decomposed.view(B, Band, H, W, C)
-        x_decomposed = self._attention(x_decomposed) 
-        band_outputs = self._compute_splines(x_decomposed)  
-        fused = torch.mean(band_outputs, dim=1)  
-        fused = fused.view(B, H, W, self.out_features).permute(0, 3, 1, 2)  
-        return fused  
+        x_decomposed = self._spectral_decompose(x) 
+        x_att = self._attention(x_decomposed) 
+        band_outputs = self._compute_splines(x_att) 
+        fused = torch.mean(band_outputs, dim=1) 
+        fused = fused.view(B, H, W, self.out_features).permute(0, 3, 1, 2) 
+        return fused 
 
 class SSAMBlock(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        num_bands: int = 4,
-        grid_size: int = 5,
-        spline_order: int = 3,
-        residual: bool = True,
-        norm: nn.Module = nn.BatchNorm2d,
-        act: nn.Module = nn.GELU(),
-    ):
+    def __init__(self, dim, num_bands=4, grid_size=5, spline_order=3, residual=True):
         super().__init__()
-        self.dim = dim
-        self.kan = SSAMLayer(
-            in_features=self.dim,
-            out_features=self.dim,
-            num_bands=num_bands,
-            grid_size=grid_size,
-            spline_order=spline_order
-        )
-        self.norm = norm(self.dim) if norm is not None else nn.Identity()
-        self.act = act
+        self.kan = SSAMLayer(in_features=dim, out_features=dim, num_bands=num_bands, grid_size=grid_size, spline_order=spline_order)
+        self.norm = nn.BatchNorm2d(dim)
+        self.act = nn.GELU()
         self.residual = residual
 
     def forward(self, x):
-        identity = x
+        res = x
         x = self.kan(x)
         x = self.norm(x)
         x = self.act(x)
-        return x + identity if self.residual else x
+        return x + res if self.residual else x
 
 # ---------------------------
 # D2Encoder
@@ -574,11 +577,11 @@ class FVBLNet(nn.Module):
         
         self.dim_16 = 16
         self.dim_32 = 32
+        self.dim_48 = 48
         self.dim_64 = 64
         self.dim_128 = 128
         self.dim_256 = 256
         self.dim_512 = 512
-        self.dim_1024 = 1024
 
         # Stem
         self.conv_stem = nn.Sequential(
@@ -593,34 +596,34 @@ class FVBLNet(nn.Module):
         )
 
         # Encoders & Decoders
-        self.encoder1 = D2Encoder(self.dim_32, self.dim_64)
-        self.encoder2 = D2Encoder(self.dim_64, self.dim_128)
-        self.encoder3 = D2Encoder(self.dim_128, self.dim_256)
-        self.encoder4 = D2Encoder(self.dim_256, self.dim_512)
+        self.encoder1 = D2Encoder(self.dim_32, self.dim_48)
+        self.encoder2 = D2Encoder(self.dim_48, self.dim_64)
+        self.encoder3 = D2Encoder(self.dim_64, self.dim_128)
+        self.encoder4 = D2Encoder(self.dim_128, self.dim_256)
         
-        self.decoder1 = DSFDecoder(self.dim_512, self.dim_256)
-        self.decoder2 = DSFDecoder(self.dim_256, self.dim_128)
-        self.decoder3 = DSFDecoder(self.dim_128, self.dim_64)
-        self.decoder4 = DSFDecoder(self.dim_64, self.dim_32)
+        self.decoder1 = DSFDecoder(self.dim_256, self.dim_128)
+        self.decoder2 = DSFDecoder(self.dim_128, self.dim_64)
+        self.decoder3 = DSFDecoder(self.dim_64, self.dim_48)
+        self.decoder4 = DSFDecoder(self.dim_48, self.dim_32)
 
         # ViL Blocks
-        self.vile3 = ViLBlockPair(self.dim_256)
-        self.vile4 = ViLBlockPair(self.dim_512)
-        self.vilb  = ViLBlockPair(self.dim_512)
-        self.vild1 = ViLBlockPair(self.dim_256)
-        self.vild2 = ViLBlockPair(self.dim_128)
+        self.vile3 = ViLBlockPair(self.dim_128)
+        self.vile4 = ViLBlockPair(self.dim_256)
+        self.vilb  = ViLBlockPair(self.dim_256)
+        self.vild1 = ViLBlockPair(self.dim_128)
+        self.vild2 = ViLBlockPair(self.dim_64)
 
-        self.block2 = SSAMBlock(dim=self.dim_512)
-        self.sg = CASA(self.dim_512)
+        self.block2 = SSAMBlock(dim=self.dim_256)
+        self.sg = CASA(self.dim_256)
         self.changeconv = nn.Sequential(
-            nn.Conv2d(self.dim_1024, self.dim_512, 3, padding=1, bias=False),
-            nn.BatchNorm2d(self.dim_512), nn.ReLU(),
-            nn.Conv2d(self.dim_512, self.dim_512, 1, bias=False)
+            nn.Conv2d(self.dim_512, self.dim_256, 3, padding=1, bias=False),
+            nn.BatchNorm2d(self.dim_256), nn.ReLU(),
+            nn.Conv2d(self.dim_256, self.dim_256, 1, bias=False)
         )
 
-        self.cs1 = CSB(self.dim_128, self.dim_64)
-        self.cs2 = CSB(self.dim_256, self.dim_128)
-        self.cs3 = CSB(self.dim_512, self.dim_256)
+        self.cs1 = CSB(self.dim_64, self.dim_48)
+        self.cs2 = CSB(self.dim_128, self.dim_64)
+        self.cs3 = CSB(self.dim_256, self.dim_128)
         
         self.outblock = final_outblock(self.dim_32)
 
@@ -650,10 +653,9 @@ class FVBLNet(nn.Module):
         xb = self.vilb(xb.reshape(B, C, H*W).transpose(-1, -2)).transpose(-1, -2).reshape(B, C, H, W)
 
         # Decoding
-        d1 = self.vild1(self.decoder1(xb, skip_4).reshape(B, self.dim_256, -1).transpose(-1, -2)).transpose(-1, -2).reshape(B, self.dim_256, 14, 14)
-        d2 = self.vild2(self.decoder2(d1 + skip_3, skip_3).reshape(B, self.dim_128, -1).transpose(-1, -2)).transpose(-1, -2).reshape(B, self.dim_128, 28, 28)
+        d1 = self.vild1(self.decoder1(xb, skip_4).reshape(B, self.dim_128, -1).transpose(-1, -2)).transpose(-1, -2).reshape(B, self.dim_128, 14, 14)
+        d2 = self.vild2(self.decoder2(d1 + skip_3, skip_3).reshape(B, self.dim_64, -1).transpose(-1, -2)).transpose(-1, -2).reshape(B, self.dim_64, 28, 28)
         d3 = self.decoder3(d2 + skip_2, skip_2)
         d4 = self.decoder4(d3, x1 + d3)
         
         return self.outblock(d4)
-
